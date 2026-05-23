@@ -7,8 +7,26 @@ This package implements the [libdns](https://github.com/libdns/libdns) interface
 ## Requirements
 
 - **Virtualmin ≥ 7.50.0** — earlier versions have a bug ([#1104](https://github.com/virtualmin/virtualmin-gpl/issues/1104)) that strips spaces from TXT record values written via the API.
-- The authenticating Webmin user must be the **master administrator** (`root` or `admin`). The Remote API is not accessible to virtual-server owners.
-- The Webmin user must have the *Virtualmin Remote CLI* ACL bit enabled.
+- The target DNS zone must be configured as a **Virtualmin virtual server with DNS enabled**. Raw BIND zones managed directly by Webmin's BIND module (without an associated virtual server) are not accessible via the Virtualmin Remote API.
+- The authenticating Webmin user must have access to the **Virtualmin Virtual Servers** module and DNS management rights for the target domain. The system `root` account works, as does a dedicated Webmin user scoped to the specific domain.
+
+## Known limitations
+
+### TXT value truncation in GetRecords
+
+Virtualmin's `get-dns` API returns records in a fixed-width plaintext table where the value column is **41 characters wide**. Long TXT values are silently truncated:
+
+- ACME DNS-01 challenge tokens are 43 characters — truncated by 2 chars
+- DKIM public keys are typically 200+ characters — severely truncated
+- SPF records with many includes may also be truncated
+
+`GetRecords` therefore cannot return reliable full TXT values for long records. This does **not** affect ACME DNS-01 correctness:
+
+- `AppendRecords` writes the full value correctly via `modify-dns`
+- `DeleteRecords` targets records by **name and type only** (not value), so truncation does not affect deletion
+- Caddy's ACME solver never reads back the challenge token after writing it
+
+If you need to read full TXT values, query DNS directly (e.g. `dig TXT _acme-challenge.example.com`).
 
 ## Credentials
 
@@ -16,14 +34,17 @@ You may authenticate with either a **Webmin API key** (preferred) or a **usernam
 
 ### Webmin API key
 
-Generate a key in Webmin → Webmin Users → your user → API Tokens, then supply it as `APIKey`.
+Generate a key in Webmin → Webmin Users → your user → API Tokens, then supply it as `APIKey`. This is preferred as it avoids exposing a password.
 
 ### Username + password
 
-Use the Webmin master administrator credentials.  Be aware that this grants full control of the Webmin server.  Mitigate the risk by:
+Any Webmin user with access to the Virtualmin Virtual Servers module and DNS management rights for the target domain. This does not have to be `root` — a dedicated user scoped to the specific domain is sufficient and safer.
 
-- Running Caddy on the same host as Virtualmin and pointing `ServerURL` at `https://127.0.0.1:10000`.
-- Creating a dedicated Webmin admin user with a separate password.
+To configure a scoped user in Webmin:
+
+1. Webmin → Webmin Users → Create a new user
+2. Under **Available Webmin modules**, tick **Virtualmin Virtual Servers**
+3. Under **Virtualmin Virtual Servers** module access, restrict to the specific domain and enable DNS management only
 
 ## Usage
 
@@ -38,16 +59,17 @@ import (
 provider := &virtualmin.Provider{
     ServerURL: "https://vps.example.com:10000",
     APIKey:    "my-webmin-api-key",
-    // Or: Username: "root", Password: "secret",
+    // Or: Username: "caddy", Password: "secret",
 }
 
 zone := "example.com."
 ctx := context.Background()
 
-// List all records.
+// List all records (note: TXT values > 41 chars are truncated).
 records, err := provider.GetRecords(ctx, zone)
 
 // Append a TXT record (e.g. for ACME DNS-01 challenge).
+// Full value is always written correctly regardless of length.
 _, err = provider.AppendRecords(ctx, zone, []libdns.Record{
     libdns.TXT{
         Name: "_acme-challenge",
@@ -56,11 +78,10 @@ _, err = provider.AppendRecords(ctx, zone, []libdns.Record{
     },
 })
 
-// Delete it afterwards.
+// Delete by name+type. Value is not used for matching.
 _, err = provider.DeleteRecords(ctx, zone, []libdns.Record{
     libdns.TXT{
         Name: "_acme-challenge",
-        Text: "challenge-token-value",
     },
 })
 ```
@@ -83,37 +104,33 @@ tls {
 
 ## Self-signed Webmin certificate
 
-If your Webmin instance uses a self-signed TLS certificate, set `Insecure: true`.
-This disables certificate verification and should **not** be used in production
-without understanding the security implications.  The recommended approach is to
-configure a proper certificate for Webmin (Virtualmin can manage Let's Encrypt
-certificates for Webmin itself).
+If your Webmin instance uses a self-signed TLS certificate, set `Insecure: true`. This disables certificate verification and should **not** be used in production. The recommended approach is to configure a proper certificate for Webmin (Virtualmin can manage Let's Encrypt certificates for Webmin itself).
 
 ## How it works
 
-Records are managed via the [Virtualmin Remote API](https://www.virtualmin.com/docs/development/remote-api/):
+Records are managed via the [Virtualmin Remote API](https://www.virtualmin.com/docs/development/remote-api/) at `/virtual-server/remote.cgi`:
 
-| libdns method    | Virtualmin program | API call |
+| libdns method    | Virtualmin program | Notes |
 |---|---|---|
-| `GetRecords`     | `get-dns`    | `?program=get-dns&multiline=1&json=1` |
-| `AppendRecords`  | `modify-dns` | `add-record-with-ttl=<name TYPE ttl value>` |
-| `SetRecords`     | `modify-dns` | delete matching RRset, then append new records |
-| `DeleteRecords`  | `modify-dns` | `remove-record=<name TYPE value>` |
+| `GetRecords`     | `get-dns` | Parses fixed-width 77-char plaintext rows from the JSON response. TXT values truncated at 41 chars. |
+| `AppendRecords`  | `modify-dns` | `add-record-with-ttl=<name TYPE ttl value>`. Full value written correctly. |
+| `SetRecords`     | `modify-dns` | Fetches existing records, deletes matching (name, type) pairs, appends new records. Not atomic. |
+| `DeleteRecords`  | `modify-dns` | `remove-record=<name TYPE>`. Value intentionally omitted — see truncation caveat above. |
 
-`modify-dns` automatically increments the SOA serial and reloads BIND via `rndc reload <zone>`.  For secondary nameservers that receive NOTIFY from the primary, this is sufficient.  For slaves not in Virtualmin's cluster, you may need to increase `propagation_delay` in Caddy to cover the slave's SOA refresh interval.
+`modify-dns` automatically increments the SOA serial and reloads BIND via `rndc reload`. For secondary nameservers outside Virtualmin's cluster, increase `propagation_delay` in Caddy to cover the slave's SOA refresh interval.
 
 ## Running the integration tests
 
 ```shell
 export TEST_VIRTUALMIN_URL=https://vps.example.com:10000
 export TEST_VIRTUALMIN_API_KEY=my-api-key  # or USER + PASS
-export TEST_ZONE=example.com.
+export TEST_ZONE=example.com.              # trailing dot required
 # export TEST_VIRTUALMIN_INSECURE=1        # if self-signed cert
 
 go test -v ./...
 ```
 
-The tests create and delete records in the named zone.  Use a dedicated test zone or at minimum a sub-domain you control.
+The tests create and delete records in the named zone. Use a test zone or subdomain you control.
 
 ## Supported record types
 
@@ -123,7 +140,7 @@ The tests create and delete records in the named zone.  Use a dedicated test zon
 | CNAME    | ✅ | ✅ |
 | MX       | ✅ | ✅ |
 | NS       | ✅ | ✅ |
-| TXT      | ✅ | ✅ |
+| TXT      | ✅ (truncated > 41 chars) | ✅ (full value) |
 | SRV      | ✅ | ✅ |
 | CAA      | ✅ | ✅ |
 | Other    | ✅ (as `libdns.RR`) | ✅ (raw RDATA passthrough) |
