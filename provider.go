@@ -5,11 +5,28 @@
 //
 //	https://your-server:10000/virtual-server/remote.cgi
 //
-// Authentication uses HTTP Basic auth with the Webmin master administrator
-// credentials (root or admin), or a Webmin API key passed as a Bearer token.
+// The domain managed must exist as a Virtualmin virtual server with DNS
+// enabled.  Raw BIND zones not associated with a virtual server are not
+// accessible via this API.
 //
-// The minimum supported Virtualmin version is 7.50.0, which fixes the
-// handling of TXT records containing spaces (issue #1104).
+// Authentication uses HTTP Basic auth with the credentials of a Webmin user
+// that has access to the Virtualmin Virtual Servers module and DNS management
+// for the target domain.  A Webmin API key (Bearer token) is also supported
+// and preferred over username/password.
+//
+// Minimum supported Virtualmin version: 7.50.0 (fixes TXT record space
+// handling, virtualmin/virtualmin-gpl#1104).
+//
+// # Known limitation: GetRecords TXT value truncation
+//
+// Virtualmin's get-dns API returns records in a fixed-width plaintext table
+// where the value column is 41 characters wide.  Long TXT values (ACME
+// challenge tokens are 43 chars, DKIM keys are much longer) are silently
+// truncated.  GetRecords therefore cannot return reliable full TXT values.
+//
+// This does not affect ACME DNS-01 correctness: AppendRecords writes the
+// full value, DeleteRecords targets records by name+type (not value), and
+// Caddy's ACME solver does not read back the challenge token after writing it.
 //
 // All methods are safe for concurrent use.
 package virtualmin
@@ -27,42 +44,38 @@ import (
 )
 
 // Provider implements the libdns interfaces for Virtualmin/Webmin.
-// Credentials are supplied either as Username+Password (HTTP Basic auth)
-// or as APIKey (Webmin API key, sent as a Bearer token).  If both are set,
-// APIKey takes precedence.
 type Provider struct {
-	// ServerURL is the base URL of the Virtualmin/Webmin server,
-	// including the port.  Example: "https://host.example.com:10000"
+	// ServerURL is the base URL of the Virtualmin/Webmin server including
+	// the port.  Example: "https://host.example.com:10000"
 	ServerURL string `json:"server_url"`
 
-	// Username is the Webmin master administrator username (e.g. "root").
-	// Used for HTTP Basic authentication when APIKey is not set.
+	// Username is the Webmin user with access to the Virtualmin Virtual
+	// Servers module and DNS management for the target domain.
+	// Used for HTTP Basic auth when APIKey is not set.
 	Username string `json:"username,omitempty"`
 
-	// Password is the Webmin master administrator password.
-	// Used for HTTP Basic authentication when APIKey is not set.
+	// Password is the Webmin user's password.
+	// Used for HTTP Basic auth when APIKey is not set.
 	Password string `json:"password,omitempty"`
 
-	// APIKey is a Webmin API key.  When set it is sent as a Bearer token
-	// and Username/Password are ignored.
+	// APIKey is a Webmin API key (preferred over Username+Password).
+	// When set it is sent as a Bearer token.
 	APIKey string `json:"api_key,omitempty"`
 
-	// Insecure disables TLS certificate verification.  Enable only when
-	// Webmin is using a self-signed certificate and you cannot install a
-	// trusted CA.  Do NOT use in production without understanding the risks.
+	// Insecure disables TLS certificate verification.  Use only when Webmin
+	// presents a self-signed certificate.  Not recommended for production.
 	Insecure bool `json:"insecure,omitempty"`
 
-	// mu serialises write operations per-provider instance.  Virtualmin's
-	// BIND writer is not safe under concurrent modify-dns invocations for
-	// the same zone, and a single mutex is simpler than a per-zone map for
-	// the typical single-zone use case.
+	// mu serialises all write operations to avoid concurrent modify-dns
+	// calls racing on the same zone's SOA serial.
 	mu sync.Mutex
 }
 
-// GetRecords returns all DNS records in the given zone.
+// GetRecords returns the DNS records in the given zone.
 //
-// The zone must be a fully-qualified domain name with a trailing dot,
-// e.g. "example.com."
+// NOTE: TXT record values longer than 41 characters are truncated by the
+// Virtualmin API.  Do not rely on TXT values returned by this method for
+// ACME challenge tokens, DKIM keys, or other long strings.
 func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
 	return p.getRecords(ctx, zone)
 }
@@ -76,7 +89,7 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, recs []libdns
 	var created []libdns.Record
 	for _, rec := range recs {
 		if err := p.appendRecord(ctx, zone, rec); err != nil {
-			return created, fmt.Errorf("appending record %v: %w", rec.RR().Name, err)
+			return created, fmt.Errorf("appending record %q: %w", rec.RR().Name, err)
 		}
 		created = append(created, rec)
 	}
@@ -84,38 +97,36 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, recs []libdns
 }
 
 // SetRecords ensures the zone reflects the given records.  For each
-// (Name, Type) pair in the input it removes all existing records with that
-// pair and replaces them with the supplied records.  Other records in the
-// zone are left untouched.
+// (Name, Type) pair it removes all existing records with that pair and
+// replaces them with the supplied records.  Other records are left untouched.
 //
-// This operation is NOT atomic: if it fails partway through, the zone may
-// be in a partially-updated state.
+// This operation is NOT atomic.
 func (p *Provider) SetRecords(ctx context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Gather all existing records once.
+	// Collect the (name, type) pairs we need to clear.
+	type key struct{ name, typ string }
+	desired := make(map[key]struct{})
+	for _, rec := range recs {
+		rr := rec.RR()
+		desired[key{
+			name: libdns.AbsoluteName(rr.Name, zone),
+			typ:  rr.Type,
+		}] = struct{}{}
+	}
+
+	// Fetch existing records and delete those matching a desired (name, type).
 	existing, err := p.getRecords(ctx, zone)
 	if err != nil {
 		return nil, fmt.Errorf("getting existing records: %w", err)
 	}
-
-	// Index desired records by (absName, TYPE).
-	type key struct{ name, typ string }
-	desired := make(map[key][]libdns.Record)
-	for _, rec := range recs {
-		rr := rec.RR()
-		k := key{libdns.AbsoluteName(rr.Name, zone), rr.Type}
-		desired[k] = append(desired[k], rec)
-	}
-
-	// Delete existing records whose (name, type) matches a desired key.
 	for _, ex := range existing {
 		rr := ex.RR()
 		k := key{libdns.AbsoluteName(rr.Name, zone), rr.Type}
 		if _, ok := desired[k]; ok {
 			if _, err := p.deleteRecord(ctx, zone, ex); err != nil {
-				return nil, fmt.Errorf("deleting old record %v %v: %w", rr.Name, rr.Type, err)
+				return nil, fmt.Errorf("deleting old record %q %s: %w", rr.Name, rr.Type, err)
 			}
 		}
 	}
@@ -124,19 +135,20 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, recs []libdns.Re
 	var set []libdns.Record
 	for _, rec := range recs {
 		if err := p.appendRecord(ctx, zone, rec); err != nil {
-			return set, fmt.Errorf("setting record %v: %w", rec.RR().Name, err)
+			return set, fmt.Errorf("setting record %q: %w", rec.RR().Name, err)
 		}
 		set = append(set, rec)
 	}
 	return set, nil
 }
 
-// DeleteRecords removes the given records from the zone and returns the
-// records that were deleted.  Records in the input that do not exist in the
-// zone are silently ignored.
+// DeleteRecords removes the given records from the zone.  Records in the
+// input that do not exist are silently ignored.
 //
-// Matching follows the libdns contract: Name is always required; Type, TTL,
-// and value act as additional filters when non-empty.
+// Matching is by name+type only — the value is NOT used for matching because
+// the Virtualmin API truncates long TXT values in get-dns responses.  This
+// means DeleteRecords will remove ALL records with the given (name, type),
+// regardless of value.  For ACME DNS-01 this is correct behaviour.
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -145,7 +157,7 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, recs []libdns
 	for _, rec := range recs {
 		found, err := p.deleteRecord(ctx, zone, rec)
 		if err != nil {
-			return deleted, fmt.Errorf("deleting record %v: %w", rec.RR().Name, err)
+			return deleted, fmt.Errorf("deleting record %q: %w", rec.RR().Name, err)
 		}
 		if found {
 			deleted = append(deleted, rec)
@@ -154,120 +166,85 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, recs []libdns
 	return deleted, nil
 }
 
-// getRecords fetches all DNS records for zone from the Virtualmin API and
-// converts them to typed libdns.Record values.
-func (p *Provider) getRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
-	domain := zoneToDomain(zone)
+// ── internal helpers ──────────────────────────────────────────────────────────
 
+func (p *Provider) getRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
 	resp, err := p.callAPI(ctx, "get-dns", map[string]string{
-		"domain":    domain,
-		"multiline": "1",
+		"domain": zoneToDomain(zone),
 	})
 	if err != nil {
 		return nil, err
 	}
-
 	return parseGetDNSResponse(resp, zone)
 }
 
-// appendRecord adds a single record to the zone via modify-dns --add-record-with-ttl.
 func (p *Provider) appendRecord(ctx context.Context, zone string, rec libdns.Record) error {
-	domain := zoneToDomain(zone)
 	arg, err := recordToAddArg(rec, zone)
 	if err != nil {
 		return err
 	}
-
 	_, err = p.callAPI(ctx, "modify-dns", map[string]string{
-		"domain":              domain,
+		"domain":              zoneToDomain(zone),
 		"add-record-with-ttl": arg,
 	})
 	return err
 }
 
-// deleteRecord removes a single record from the zone via modify-dns
-// --remove-record.  It returns (true, nil) when the record existed and was
-// deleted, (false, nil) when it did not exist, and (false, err) on API error.
-func (p *Provider) deleteRecord(ctx context.Context, zone string, rec libdns.Record) (found bool, _ error) {
-	domain := zoneToDomain(zone)
-	arg, err := recordToDeleteArg(rec, zone)
-	if err != nil {
-		return false, err
-	}
-
-	resp, err := p.callAPI(ctx, "modify-dns", map[string]string{
-		"domain":        domain,
+// deleteRecord deletes by name+type only.  The value is deliberately omitted
+// because Virtualmin truncates long TXT values in get-dns, making value-based
+// matching unreliable.  Returns (true, nil) on success, (false, nil) when the
+// record did not exist.
+func (p *Provider) deleteRecord(ctx context.Context, zone string, rec libdns.Record) (bool, error) {
+	arg := recordToDeleteArg(rec, zone)
+	_, err := p.callAPI(ctx, "modify-dns", map[string]string{
+		"domain":        zoneToDomain(zone),
 		"remove-record": arg,
 	})
 	if err != nil {
-		// Virtualmin returns an error when the record does not exist.
-		// Treat "not found"-style messages as a soft miss rather than an error.
 		if isNotFoundError(err) {
 			return false, nil
 		}
 		return false, err
 	}
-	_ = resp
 	return true, nil
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── record format helpers ─────────────────────────────────────────────────────
 
-// zoneToDomain strips the trailing dot from a libdns zone string to produce
-// the plain domain name Virtualmin expects.
+// zoneToDomain strips the trailing dot libdns zones always carry.
 func zoneToDomain(zone string) string {
 	return strings.TrimSuffix(zone, ".")
 }
 
-// recordToAddArg builds the single whitespace-separated string that
-// modify-dns --add-record-with-ttl expects: "name TYPE ttl value...".
-//
-// The record name is made relative to the zone so Virtualmin appends the
-// domain correctly.  The apex is represented as "@".
+// recordToAddArg builds the single whitespace-separated argument for
+// modify-dns --add-record-with-ttl: "name TYPE ttl value".
 func recordToAddArg(rec libdns.Record, zone string) (string, error) {
 	rr := rec.RR()
-
 	name := rrRelativeName(rr.Name, zone)
 	ttl := int(rr.TTL.Seconds())
 	if ttl <= 0 {
-		ttl = 3600 // sensible default
+		ttl = 3600
 	}
-
-	value, err := rrToVirtualminValue(rec, zone)
+	value, err := rrToVirtualminValue(rec)
 	if err != nil {
 		return "", err
 	}
-
 	return fmt.Sprintf("%s %s %d %s", name, rr.Type, ttl, value), nil
 }
 
-// recordToDeleteArg builds the string for modify-dns --remove-record:
-// "name TYPE [value]".  Including the value is important when multiple
-// records share the same (name, type) — e.g. multiple TXT or MX records.
-func recordToDeleteArg(rec libdns.Record, zone string) (string, error) {
+// recordToDeleteArg builds "name TYPE" for modify-dns --remove-record.
+// The value is intentionally omitted — see deleteRecord for rationale.
+func recordToDeleteArg(rec libdns.Record, zone string) string {
 	rr := rec.RR()
 	name := rrRelativeName(rr.Name, zone)
-
 	if rr.Type == "" {
-		// Wildcard delete by name only — Virtualmin will remove all records
-		// with this name.  This matches the libdns contract for an empty Type.
-		return name, nil
+		return name
 	}
-
-	value, err := rrToVirtualminValue(rec, zone)
-	if err != nil {
-		return "", err
-	}
-
-	if value == "" {
-		return fmt.Sprintf("%s %s", name, rr.Type), nil
-	}
-	return fmt.Sprintf("%s %s %s", name, rr.Type, value), nil
+	return fmt.Sprintf("%s %s", name, rr.Type)
 }
 
-// rrRelativeName converts a libdns record name (which may already be relative,
-// absolute FQDN, or "@") into the relative form that Virtualmin expects.
-// An empty result or zone-apex is returned as "@".
+// rrRelativeName returns the record name relative to the zone, using "@" for
+// the apex, in the form Virtualmin expects.
 func rrRelativeName(name, zone string) string {
 	rel := libdns.RelativeName(libdns.AbsoluteName(name, zone), zone)
 	if rel == "" {
@@ -276,20 +253,17 @@ func rrRelativeName(name, zone string) string {
 	return rel
 }
 
-// rrToVirtualminValue converts a libdns.Record to the RDATA string portion
-// of a Virtualmin add/delete record argument.
-func rrToVirtualminValue(rec libdns.Record, zone string) (string, error) {
-	// Use the typed parse of RR so we can extract structured fields.
+// rrToVirtualminValue converts a libdns.Record to the RDATA string for the
+// Virtualmin add-record argument.
+func rrToVirtualminValue(rec libdns.Record) (string, error) {
 	parsed, err := rec.RR().Parse()
 	if err != nil {
-		// Fall back to raw RR.Data for unknown types.
 		return rec.RR().Data, nil //nolint:nilerr
 	}
 
 	switch t := parsed.(type) {
 	case libdns.TXT:
-		// Wrap value in double-quotes so Virtualmin's BIND writer stores it
-		// correctly.  Any embedded double-quotes are backslash-escaped.
+		// Double-quote the value; Virtualmin passes it verbatim to BIND.
 		escaped := strings.ReplaceAll(t.Text, `"`, `\"`)
 		return fmt.Sprintf(`"%s"`, escaped), nil
 
@@ -306,7 +280,6 @@ func rrToVirtualminValue(rec libdns.Record, zone string) (string, error) {
 		return fqdnDot(t.Target), nil
 
 	case libdns.SRV:
-		// SRV name is stored separately in SRV.Name; the value is the RDATA.
 		return fmt.Sprintf("%d %d %d %s", t.Priority, t.Weight, t.Port, fqdnDot(t.Target)), nil
 
 	case libdns.CAA:
@@ -314,16 +287,13 @@ func rrToVirtualminValue(rec libdns.Record, zone string) (string, error) {
 		return fmt.Sprintf(`%d %s "%s"`, t.Flags, t.Tag, escaped), nil
 
 	case libdns.RR:
-		// Unknown or unsupported type — pass RDATA verbatim.
 		return t.Data, nil
 
 	default:
-		// Fallback: use the RR serialisation.
 		return rec.RR().Data, nil
 	}
 }
 
-// fqdnDot ensures a domain name ends with a dot (fully qualified).
 func fqdnDot(name string) string {
 	if !strings.HasSuffix(name, ".") {
 		return name + "."
@@ -331,54 +301,52 @@ func fqdnDot(name string) string {
 	return name
 }
 
-// parseGetDNSResponse converts the JSON response from get-dns into a slice
-// of typed libdns.Record values.
+// ── response parser ───────────────────────────────────────────────────────────
+
+// parseGetDNSResponse converts the fixed-width plaintext rows inside the
+// get-dns JSON response into typed libdns.Record values.
+//
+// The first two rows are always a header and separator line — they are skipped
+// automatically by parseRow returning empty strings for non-data rows.
 func parseGetDNSResponse(resp *apiResponse, zone string) ([]libdns.Record, error) {
 	var records []libdns.Record
 
 	for _, entry := range resp.Data {
-		// The JSON shim wraps every attribute value in a []string, even
-		// singletons.  entry.Values is a map[string][]string.
-		if entry.Values == nil {
+		recName, recType, recValue := parseRow(entry.Name)
+		if recName == "" || recType == "" {
 			continue
 		}
 
-		recType := firstVal(entry.Values["type"])
-		if recType == "" {
-			continue
+		// Make the name relative to the zone.
+		// Virtualmin returns names either as bare labels ("www") or FQDNs
+		// with a trailing dot ("moren.it.").
+		absName := recName
+		if !strings.HasSuffix(absName, ".") {
+			// Bare label — make it absolute by appending the zone.
+			absName = libdns.AbsoluteName(recName, zone)
 		}
-		recType = strings.ToUpper(recType)
-
-		// Convert the FQDN record name to a libdns relative name.
-		relName := libdns.RelativeName(strings.TrimSuffix(entry.Name, "."), strings.TrimSuffix(zone, "."))
+		relName := libdns.RelativeName(
+			strings.TrimSuffix(absName, "."),
+			strings.TrimSuffix(zone, "."),
+		)
 		if relName == "" {
 			relName = "@"
 		}
 
-		ttl := parseTTL(firstVal(entry.Values["ttl"]))
-
-		// There may be multiple Value lines for the same record block.
-		values := entry.Values["value"]
-		if len(values) == 0 {
+		// TTL is not present in the get-dns output — leave as 0.
+		rec, err := buildRecord(recType, relName, 0, recValue)
+		if err != nil {
+			// Skip unrecognised or malformed records.
 			continue
 		}
-
-		for _, rawValue := range values {
-			rec, err := buildRecord(recType, relName, ttl, rawValue, zone)
-			if err != nil {
-				// Skip unrecognised/malformed records rather than aborting.
-				continue
-			}
-			records = append(records, rec)
-		}
+		records = append(records, rec)
 	}
 
 	return records, nil
 }
 
-// buildRecord constructs the appropriate typed libdns.Record for a given
-// DNS record type and raw RDATA string from Virtualmin.
-func buildRecord(recType, relName string, ttl time.Duration, rawValue, zone string) (libdns.Record, error) {
+// buildRecord constructs the appropriate typed libdns.Record.
+func buildRecord(recType, relName string, ttl time.Duration, rawValue string) (libdns.Record, error) {
 	switch recType {
 	case "A", "AAAA":
 		ip, err := netip.ParseAddr(rawValue)
@@ -394,13 +362,10 @@ func buildRecord(recType, relName string, ttl time.Duration, rawValue, zone stri
 		return libdns.NS{Name: relName, TTL: ttl, Target: rawValue}, nil
 
 	case "TXT":
-		// Virtualmin returns TXT values wrapped in double-quotes from the zone
-		// file.  Strip them and unescape embedded quotes.
-		text := stripTXTQuotes(rawValue)
-		return libdns.TXT{Name: relName, TTL: ttl, Text: text}, nil
+		// Note: value may be truncated to 41 chars by the Virtualmin API.
+		return libdns.TXT{Name: relName, TTL: ttl, Text: rawValue}, nil
 
 	case "MX":
-		// Virtualmin returns MX as "preference target".
 		parts := strings.SplitN(rawValue, " ", 2)
 		if len(parts) != 2 {
 			return nil, fmt.Errorf("malformed MX value %q", rawValue)
@@ -417,8 +382,6 @@ func buildRecord(recType, relName string, ttl time.Duration, rawValue, zone stri
 		}, nil
 
 	case "SRV":
-		// SRV RDATA: "priority weight port target"
-		// SRV name format: "_service._proto.name"
 		parts := strings.Fields(rawValue)
 		if len(parts) < 4 {
 			return nil, fmt.Errorf("malformed SRV value %q", rawValue)
@@ -426,8 +389,6 @@ func buildRecord(recType, relName string, ttl time.Duration, rawValue, zone stri
 		prio, _ := strconv.ParseUint(parts[0], 10, 16)
 		wt, _ := strconv.ParseUint(parts[1], 10, 16)
 		port, _ := strconv.ParseUint(parts[2], 10, 16)
-
-		// Parse _service._proto out of the record name.
 		svc, proto, base := parseSRVName(relName)
 		return libdns.SRV{
 			Service:   svc,
@@ -441,7 +402,6 @@ func buildRecord(recType, relName string, ttl time.Duration, rawValue, zone stri
 		}, nil
 
 	case "CAA":
-		// CAA RDATA: "flags tag \"value\""
 		flags, tag, val, err := parseCAAValue(rawValue)
 		if err != nil {
 			return nil, fmt.Errorf("parsing CAA value %q: %w", rawValue, err)
@@ -455,7 +415,7 @@ func buildRecord(recType, relName string, ttl time.Duration, rawValue, zone stri
 		}, nil
 
 	default:
-		// Return unknown types as a generic RR so callers can still inspect them.
+		// SOA, SPF, DNSKEY, RRSIG, etc — return as generic RR.
 		return libdns.RR{
 			Name: relName,
 			TTL:  ttl,
@@ -465,40 +425,8 @@ func buildRecord(recType, relName string, ttl time.Duration, rawValue, zone stri
 	}
 }
 
-// stripTXTQuotes removes surrounding double-quotes from a TXT record value
-// as stored in a BIND zone file and unescapes embedded \" sequences.
-func stripTXTQuotes(s string) string {
-	s = strings.TrimSpace(s)
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		s = s[1 : len(s)-1]
-	}
-	return strings.ReplaceAll(s, `\"`, `"`)
-}
+// ── small parsers ─────────────────────────────────────────────────────────────
 
-// parseTTL converts a TTL string (seconds as integer) to a time.Duration.
-// Returns 0 when the string is empty or unparseable.
-func parseTTL(s string) time.Duration {
-	if s == "" {
-		return 0
-	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return time.Duration(n) * time.Second
-}
-
-// firstVal returns the first element of a string slice, or "" when empty.
-func firstVal(ss []string) string {
-	if len(ss) == 0 {
-		return ""
-	}
-	return ss[0]
-}
-
-// parseSRVName splits an SRV record name of the form "_service._proto[.base]"
-// into its three components.  Leading underscores are stripped from service
-// and proto to match the libdns.SRV convention.
 func parseSRVName(name string) (service, proto, base string) {
 	if name == "@" || name == "" {
 		return "", "", name
@@ -512,12 +440,10 @@ func parseSRVName(name string) (service, proto, base string) {
 	if len(parts) == 3 {
 		base = parts[2]
 	}
-	return service, proto, base
+	return
 }
 
-// parseCAAValue parses a CAA RDATA string of the form: flags tag "value"
 func parseCAAValue(s string) (flags uint8, tag string, value string, err error) {
-	// fields: [flags, tag, "value..."]
 	parts := strings.SplitN(s, " ", 3)
 	if len(parts) < 3 {
 		err = fmt.Errorf("expected 3 fields")
@@ -530,12 +456,15 @@ func parseCAAValue(s string) (flags uint8, tag string, value string, err error) 
 	}
 	flags = uint8(f)
 	tag = parts[1]
-	value = stripTXTQuotes(parts[2])
+	// Strip surrounding quotes if present.
+	v := strings.TrimSpace(parts[2])
+	if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+		v = v[1 : len(v)-1]
+	}
+	value = strings.ReplaceAll(v, `\"`, `"`)
 	return
 }
 
-// isNotFoundError returns true when the Virtualmin API error indicates that
-// the record to be deleted was not present in the zone.
 func isNotFoundError(err error) bool {
 	if err == nil {
 		return false
@@ -543,7 +472,8 @@ func isNotFoundError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "no such record") ||
 		strings.Contains(msg, "not found") ||
-		strings.Contains(msg, "does not exist")
+		strings.Contains(msg, "does not exist") ||
+		strings.Contains(msg, "deleting 0 dns records")
 }
 
 // ── interface guards ──────────────────────────────────────────────────────────

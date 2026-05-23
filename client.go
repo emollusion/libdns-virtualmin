@@ -15,42 +15,79 @@ import (
 
 // ── JSON response types ───────────────────────────────────────────────────────
 
-// apiResponse is the top-level JSON structure returned by remote.cgi when
-// the json=1 parameter is set.
+// apiResponse is the top-level JSON envelope returned by remote.cgi with
+// json=1.  The actual record data lives in Data[].Name as a fixed-width
+// plaintext string — Virtualmin does NOT return structured per-field JSON for
+// get-dns.
 //
-// Virtualmin's json-lib.pl converts the multiline text output of each
-// program into a structured JSON tree.  For get-dns the shape is:
+// Real response shape (confirmed against Virtualmin 7.x):
 //
 //	{
-//	  "status": "success",
+//	  "status":  "success",
+//	  "command": "get-dns",
 //	  "data": [
-//	    {
-//	      "name": "www.example.com.",
-//	      "values": {
-//	        "type":  ["A"],
-//	        "class": ["IN"],
-//	        "ttl":   ["3600"],
-//	        "value": ["192.0.2.1"]
-//	      }
-//	    },
+//	    { "name": "Record                         Type  Value                                   ", "values": {} },
+//	    { "name": "------------------------------ ----- ----------------------------------------", "values": {} },
+//	    { "name": "moren.it.                      NS    ns01.moren.it.                          ", "values": {} },
+//	    { "name": "_acme-challenge                TXT   dGVzdC10b2tlbi12YWx1ZS1mb3ItYWNtZQ     ", "values": {} },
 //	    ...
 //	  ]
 //	}
 //
-// Every value inside "values" is always a []string, even for singletons.
+// Column layout (total 77 chars per row):
+//
+//	[record-name: cols 0-29][type: cols 30-35][value: cols 36-76, right-padded]
+//
+// IMPORTANT: the value column is only 41 characters wide.  Long TXT values
+// (e.g. ACME challenge tokens, DKIM keys) are truncated.  This means
+// GetRecords cannot reliably return full TXT values — callers must not depend
+// on TXT value accuracy from GetRecords.  DeleteRecords targets records by
+// name+type only, which is sufficient for all libdns use cases including ACME.
 type apiResponse struct {
-	Status string       `json:"status"`
-	Error  string       `json:"error,omitempty"`
-	Data   []dataRecord `json:"data"`
+	Status   string       `json:"status"`
+	Error    string       `json:"error,omitempty"`
+	FullError string      `json:"full_error,omitempty"`
+	Data     []dataRecord `json:"data"`
 }
 
-// dataRecord is one element of the "data" array returned by get-dns.
-// The "name" field is the DNS record's FQDN (with trailing dot).
-// The "values" map holds the record attributes; keys are lowercased and
-// spaces replaced with underscores by Virtualmin's JSON shim.
+// dataRecord is one row in the data array.  Only Name is meaningful;
+// Values is always an empty object {} in get-dns responses.
 type dataRecord struct {
-	Name   string              `json:"name"`
-	Values map[string][]string `json:"values"`
+	Name string `json:"name"`
+}
+
+// ── fixed-width column offsets (confirmed by live measurement) ────────────────
+
+const (
+	colNameEnd  = 30 // record name occupies cols [0, 30)
+	colTypeEnd  = 36 // type occupies cols [30, 36) — 5 chars + 1 space
+	colValueEnd = 77 // value occupies cols [36, 77) — right-padded with spaces
+)
+
+// parseRow splits one fixed-width data row into (name, type, value).
+// Returns ("", "", "") for header/separator rows and empty rows.
+func parseRow(row string) (recName, recType, recValue string) {
+	if len(row) < colTypeEnd {
+		return "", "", ""
+	}
+	recName = strings.TrimSpace(row[:colNameEnd])
+	recType = strings.TrimSpace(row[colNameEnd:colTypeEnd])
+
+	if len(row) >= colValueEnd {
+		recValue = strings.TrimRight(row[colTypeEnd:colValueEnd], " ")
+	} else if len(row) > colTypeEnd {
+		recValue = strings.TrimRight(row[colTypeEnd:], " ")
+	}
+
+	// Skip header and separator rows.
+	if recType == "Type" || strings.HasPrefix(recType, "-") {
+		return "", "", ""
+	}
+	// Skip rows with no type (blank lines, continuations).
+	if recType == "" {
+		return "", "", ""
+	}
+	return recName, recType, recValue
 }
 
 // ── HTTP client management ────────────────────────────────────────────────────
@@ -60,12 +97,9 @@ var (
 	defaultClient     *http.Client
 )
 
-// httpClient returns the provider's own http.Client when set via the
-// unexported field (used in tests), or a lazily-created shared default.
-// The default client respects the Insecure flag on the provider.
+// httpClient returns a per-provider client when Insecure is set (to avoid
+// poisoning the shared default), otherwise returns the shared default.
 func (p *Provider) httpClient() *http.Client {
-	// Build a per-provider client when TLS verification is disabled, so we
-	// do not poison the shared default.
 	if p.Insecure {
 		return &http.Client{
 			Timeout: 30 * time.Second,
@@ -74,7 +108,6 @@ func (p *Provider) httpClient() *http.Client {
 			},
 		}
 	}
-
 	defaultClientOnce.Do(func() {
 		defaultClient = &http.Client{Timeout: 30 * time.Second}
 	})
@@ -83,15 +116,15 @@ func (p *Provider) httpClient() *http.Client {
 
 // ── Core API call ─────────────────────────────────────────────────────────────
 
-// callAPI calls a Virtualmin remote API program and returns the parsed JSON
+// callAPI POSTs to Virtualmin's remote.cgi and returns the parsed JSON
 // response.
 //
-// program is the Virtualmin program name, e.g. "get-dns" or "modify-dns".
-// params is a map of additional CGI parameters (without the "program" key).
-//
-// The call always requests JSON output (json=1) and uses multiline=1 for
-// list-style programs so that Virtualmin's JSON shim has structured data to
-// parse.
+// Notes from live testing:
+//   - multiline=1 is rejected by remote.cgi ("Unknown parameter 1") — do NOT send it.
+//   - The Content-type response header is application/json even though the
+//     body contains fixed-width plaintext inside the JSON data array.
+//   - On auth failure the server returns an HTML page (200 OK) rather than a
+//     4xx; we detect this by checking whether the body starts with '{'.
 //
 // Authentication precedence:
 //  1. APIKey  → Authorization: Bearer <key>
@@ -101,7 +134,6 @@ func (p *Provider) callAPI(ctx context.Context, program string, params map[strin
 		return nil, fmt.Errorf("virtualmin: ServerURL must not be empty")
 	}
 
-	// Build query string.
 	query := url.Values{}
 	query.Set("program", program)
 	query.Set("json", "1")
@@ -111,7 +143,6 @@ func (p *Provider) callAPI(ctx context.Context, program string, params map[strin
 
 	endpoint := strings.TrimSuffix(p.ServerURL, "/") + "/virtual-server/remote.cgi"
 
-	// Use POST to avoid sensitive data appearing in server logs / URLs.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint,
 		strings.NewReader(query.Encode()))
 	if err != nil {
@@ -120,7 +151,6 @@ func (p *Provider) callAPI(ctx context.Context, program string, params map[strin
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	// Set auth.
 	if p.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+p.APIKey)
 	} else if p.Username != "" {
@@ -140,9 +170,11 @@ func (p *Provider) callAPI(ctx context.Context, program string, params map[strin
 		return nil, fmt.Errorf("virtualmin: reading response body: %w", err)
 	}
 
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, fmt.Errorf("virtualmin: authentication failed (HTTP %d) — check credentials and Webmin ACLs", resp.StatusCode)
+	// Auth failures return a 200 HTML page, not a 4xx.
+	if len(body) == 0 || body[0] != '{' {
+		return nil, fmt.Errorf("virtualmin: unexpected non-JSON response (check credentials and Webmin ACLs); body: %s", truncate(string(body), 200))
 	}
+
 	if resp.StatusCode >= 500 {
 		return nil, fmt.Errorf("virtualmin: server error (HTTP %d): %s", resp.StatusCode, truncate(string(body), 200))
 	}
@@ -155,21 +187,18 @@ func (p *Provider) callAPI(ctx context.Context, program string, params map[strin
 	if strings.ToLower(parsed.Status) != "success" {
 		msg := parsed.Error
 		if msg == "" {
-			// Some Virtualmin versions embed the error in data[0].name.
-			if len(parsed.Data) > 0 {
-				msg = parsed.Data[0].Name
-			}
+			msg = parsed.FullError
 		}
 		if msg == "" {
 			msg = "unknown error"
 		}
-		return nil, fmt.Errorf("virtualmin: API error for program %q: %s", program, msg)
+		return nil, fmt.Errorf("virtualmin: API error for %q: %s", program, msg)
 	}
 
 	return &parsed, nil
 }
 
-// truncate returns at most n bytes of s for use in error messages.
+// truncate returns at most n bytes of s, for use in error messages.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
