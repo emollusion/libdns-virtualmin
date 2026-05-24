@@ -100,7 +100,7 @@ provider := &virtualmin.Provider{
 }
 ```
 
-In the Caddyfile (via [caddy-dns/virtualmin](https://github.com/caddy-dns/virtualmin)):
+In the Caddyfile (via [caddy-dns-virtualmin](https://github.com/emollusion/caddy-dns-virtualmin)):
 ```caddy
 dns virtualmin {
     server_url      https://vps.example.com:10000
