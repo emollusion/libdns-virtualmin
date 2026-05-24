@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/libdns/libdns"
-	"github.com/libdns/virtualmin"
+	"github.com/emollusion/libdns-virtualmin"
 )
 
 // Integration tests require a live Virtualmin server.  Set the following

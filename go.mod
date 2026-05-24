@@ -1,4 +1,4 @@
-module github.com/libdns/virtualmin
+module github.com/emollusion/libdns-virtualmin
 
 go 1.22
 
