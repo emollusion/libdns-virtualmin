@@ -245,9 +245,14 @@ func zoneToDomain(zone string) string {
 
 // recordToAddArg builds the single whitespace-separated argument for
 // modify-dns --add-record-with-ttl: "name TYPE ttl value".
+//
+// The record name is passed as a fully-qualified domain name with trailing
+// dot (e.g. "www.example.com.").  Virtualmin treats any name without a
+// trailing dot as relative and appends the domain, which causes double-
+// suffixing for multi-label names like "_acme-challenge_foo.sub".
 func recordToAddArg(rec libdns.Record, zone string) (string, error) {
 	rr := rec.RR()
-	name := rrRelativeName(rr.Name, zone)
+	name := rrAbsoluteName(rr.Name, zone)
 	ttl := int(rr.TTL.Seconds())
 	if ttl <= 0 {
 		ttl = 3600
@@ -260,18 +265,32 @@ func recordToAddArg(rec libdns.Record, zone string) (string, error) {
 }
 
 // recordToDeleteArg builds "name TYPE" for modify-dns --remove-record.
-// The value is intentionally omitted — see deleteRecord for rationale.
+// Uses FQDN with trailing dot for the same reason as recordToAddArg.
+// Value is intentionally omitted — see deleteRecord for rationale.
 func recordToDeleteArg(rec libdns.Record, zone string) string {
 	rr := rec.RR()
-	name := rrRelativeName(rr.Name, zone)
+	name := rrAbsoluteName(rr.Name, zone)
 	if rr.Type == "" {
 		return name
 	}
 	return fmt.Sprintf("%s %s", name, rr.Type)
 }
 
-// rrRelativeName returns the record name relative to the zone, using "@" for
-// the apex, in the form Virtualmin expects.
+// rrAbsoluteName returns the record name as a fully-qualified domain name
+// with a trailing dot, which Virtualmin treats as absolute (no domain suffix
+// appended).  This prevents double-suffixing of multi-label names such as
+// "_acme-challenge_foo.sub" where Virtualmin would otherwise append the
+// domain a second time.
+func rrAbsoluteName(name, zone string) string {
+	abs := libdns.AbsoluteName(name, zone)
+	if !strings.HasSuffix(abs, ".") {
+		abs += "."
+	}
+	return abs
+}
+
+// rrRelativeName is retained for use in parseGetDNSResponse where relative
+// names are needed for the libdns Record output.
 func rrRelativeName(name, zone string) string {
 	rel := libdns.RelativeName(libdns.AbsoluteName(name, zone), zone)
 	if rel == "" {
